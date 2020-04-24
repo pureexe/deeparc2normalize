@@ -49,7 +49,7 @@ def main(args):
         rotation = Rotation.from_quat([qvec[1],qvec[2],qvec[3],qvec[0]])
         extrinsics[arc][ring] = {
             'rotation': rotation.as_matrix(),
-            'translation': images[image_id][2]
+            'translation': images[image_id][2].copy()
         }
         if arc+1 > num_arc:
             num_arc = arc+1
@@ -62,18 +62,6 @@ def main(args):
     cam_points = np.zeros((num_arc * num_ring,3))
     rotation_matrix = np.zeros((num_ring , 3, 3))
     translation_vector = np.zeros((num_ring, 3))
-    #update point3d
-    points3D_old = points3D
-    points3D = {}
-    for point_id in points3D_old:
-        points3D[point_id] = Point3D(
-            id=points3D_old[point_id][0],
-            xyz=points3D_old[point_id][1] - mean_shift,
-            rgb=points3D_old[point_id][2],
-            error=points3D_old[point_id][3],
-            image_ids=points3D_old[point_id][4],
-            point2D_idxs=points3D_old[point_id][5]
-        )
     # update extrinsic
     for i in range(num_arc):
         for j in range(num_ring):
@@ -82,8 +70,7 @@ def main(args):
                 rotation_matrix[i*num_ring+j,:,:] = extrinsics[i][j]['rotation']
                 translation_vector[i*num_ring+j,:] = extrinsics[i][j]['translation']
             cam_points[i*num_ring+j] = camera_position(extrinsics[i][j])
-    
-    
+
     #############################################
     # TORCH OPIMIZATION!
     #############################################
@@ -163,7 +150,20 @@ def main(args):
             xys=images_old[image_id][5],
             point3D_ids=images_old[image_id][6]
         )
-        
+    
+    #update point3d
+    points3D_old = points3D
+    points3D = {}
+    for point_id in points3D_old:
+        points3D[point_id] = Point3D(
+            id=points3D_old[point_id][0],
+            xyz=np.matmul(rotation_corrector.T, points3D_old[point_id][1] + mean_shift),
+            rgb=points3D_old[point_id][2],
+            error=points3D_old[point_id][3],
+            image_ids=points3D_old[point_id][4],
+            point2D_idxs=points3D_old[point_id][5]
+        )
+    
     write_model(cameras, images, points3D, args.output, '.bin')
     print("FINISHED!")
 
@@ -186,22 +186,6 @@ def entry_point():
         default='output/',
         #required=True,
         help='deeparc file output')
-    """
-    parser.add_argument(
-        '-arc',
-        '--arc_size',
-        type=int,
-        #required=True,
-        default=10,
-        help='arc_size')
-    parser.add_argument(
-        '-ring',
-        '--ring_size',
-        type=int,
-        #required=True,
-        default=41,
-        help='ring_size')
-    """
     parser.add_argument(
         '-p',
         '--pattern',
