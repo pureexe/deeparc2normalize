@@ -174,6 +174,8 @@ def main(args):
         )
 
     #write to binary output
+    if not os.path.exists(args.output):
+        os.mkdir(args.output)
     write_model(cameras, images, points3D, args.output, output_extension)
     total_time = timer() - start_timer
     print('Finished in {:.2f} seconds'.format(total_time))
