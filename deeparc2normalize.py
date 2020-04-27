@@ -1,11 +1,23 @@
 from read_write_model import read_model, write_model, Image, Point3D
-import argparse
-import re
+import argparse, os, re, torch
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial.transform import Rotation
-import torch
+from timeit import default_timer as timer
+
+def detect_model(model_path,filetype = '.bin'):
+    """ 
+        detect is this colmap model directory by detect 3 files
+        which is cameras.bin images.bin and points3D.bin
+    """
+    paths = [
+        os.path.join(model_path,'cameras{}'.format(filetype)),
+        os.path.join(model_path,'images{}'.format(filetype)),
+        os.path.join(model_path,'points3D{}'.format(filetype)),
+    ]
+    for path in paths:
+        if not os.path.exists(path):
+            return False
+    return True
 
 def parse_filename(pattern,file_name):
     [[arc_id, ring_id]] = re.findall(pattern,file_name)
@@ -16,64 +28,14 @@ def parse_filename(pattern,file_name):
 def camera_position(extirnsic):
     return np.matmul(extirnsic['rotation'].T,extirnsic['translation'])
 
-def write_ply(data, path = 'output.ply'):
-    with open(path,'w') as f:
-        header = "ply\n" \
-                + "format ascii 1.0\n" \
-                + "element vertex {}\n" \
-                + "property float x\n" \
-                + "property float y\n" \
-                + "property float z\n" \
-                + "property uchar red\n" \
-                + "property uchar green\n" \
-                + "property uchar blue\n" \
-                + "end_header\n"
-        f.write(header.format(data.shape[0]))
-        for i in range(data.shape[0]):
-            color = '255 255 255'
-            if i < 42:
-                color = '0 255 0'
-            line = '{} {} {} {}\n'.format(data[i,0],data[i,1],data[i,2],color)
-            f.write(line)
-
-def main(args):
-    extrinsics = {}
-    cameras, images, points3D = read_model(args.input,'.bin')
-    num_arc = 0
-    num_ring = 0
-    for image_id in images:
-        arc, ring = parse_filename(args.pattern,images[image_id][4])
-        if arc not in extrinsics:
-            extrinsics[arc] = {}
-        qvec = images[image_id][1]
-        rotation = Rotation.from_quat([qvec[1],qvec[2],qvec[3],qvec[0]])
-        extrinsics[arc][ring] = {
-            'rotation': rotation.as_matrix(),
-            'translation': images[image_id][2].copy()
-        }
-        if arc+1 > num_arc:
-            num_arc = arc+1
-        if ring+1 > num_ring:
-            num_ring = ring+1
-    base_ring = np.zeros((num_ring,3))
-    for i in range(num_ring):
-        base_ring[i] = camera_position(extrinsics[0][i])
-    mean_shift = np.mean(base_ring,axis=0)
-    cam_points = np.zeros((num_arc * num_ring,3))
-    rotation_matrix = np.zeros((num_ring , 3, 3))
-    translation_vector = np.zeros((num_ring, 3))
-    # update extrinsic
-    for i in range(num_arc):
-        for j in range(num_ring):
-            extrinsics[i][j]['translation'] -= np.matmul(extrinsics[i][j]['rotation'],mean_shift)
-            if i == 0:
-                rotation_matrix[i*num_ring+j,:,:] = extrinsics[i][j]['rotation']
-                translation_vector[i*num_ring+j,:] = extrinsics[i][j]['translation']
-            cam_points[i*num_ring+j] = camera_position(extrinsics[i][j])
-
-    #############################################
-    # TORCH OPIMIZATION!
-    #############################################
+def find_rotation_corrector(rotation_matrix,translation_vector):
+    """
+    find rotation change using PyTorch
+    please see to under stand what is Q_x Q_y Q_z
+    @see https://en.wikipedia.org/wiki/Rotation_matrix#In_three_dimensions
+    @params rotation_matrix, translation_vector
+    @return rotation matrix that use for multiply
+    """
     rotation_matrix = torch.tensor(rotation_matrix, requires_grad=False) # SHOUDNT UPDATE
     translation_vector = torch.tensor(translation_vector, requires_grad=False) # SHOUDNT UPDATE
     translation_matrix = translation_vector.reshape((-1,3,1))
@@ -81,7 +43,6 @@ def main(args):
     optimizer = torch.optim.Adam([rotation_adjuster], lr=0.001)
     epoch_count = 0
     previous_loss = 0
-    
     while True:
         optimizer.zero_grad()
         base_x = torch.sqrt(rotation_adjuster[0]**2 + rotation_adjuster[1]**2)
@@ -119,21 +80,69 @@ def main(args):
         epoch_count += 1
         if epoch_count % 10 == 0:
             loss_value = total_loss.item()
-            print("EPOCH %4d - loss %30.6f" % (epoch_count,loss_value))
             relative_loss = np.abs((loss_value - previous_loss)/loss_value)
             if loss_value < 1e-6 or relative_loss < 1e-6:
                 break
             previous_loss = loss_value
-    rotation_corrector = rotation_corrector.detach().numpy()
-    cam_points = np.zeros((num_arc * num_ring,3))
+    return rotation_corrector.detach().numpy()
+
+def main(args):
+    start_timer = timer()
+    extrinsics = {}
+    model_extension = ''
+    if detect_model(args.input,'.bin'):
+        output_extension = '.bin'
+    elif detect_model(args.input,'.txt'):
+        output_extension = '.txt'
+    else: 
+        raise RuntimeError('Cannot find colmap sparse model. please check input path')
+    cameras, images, points3D = read_model(args.input,output_extension)
+    num_arc = 0
+    num_ring = 0  
+    # read colmap images and get rotation and translation
+    for image_id in images:
+        arc, ring = parse_filename(args.pattern,images[image_id][4])
+        if arc not in extrinsics:
+            extrinsics[arc] = {}
+        qvec = images[image_id][1]
+        rotation = Rotation.from_quat([qvec[1],qvec[2],qvec[3],qvec[0]])
+        extrinsics[arc][ring] = {
+            'rotation': rotation.as_matrix(),
+            'translation': images[image_id][2].copy()
+        }
+        #find number of arc and number of ring
+        if arc+1 > num_arc:
+            num_arc = arc+1
+        if ring+1 > num_ring:
+            num_ring = ring+1
+
+    # find camera position in most bottom ring
+    base_ring = np.zeros((num_ring,3))
+    for i in range(num_ring):
+        base_ring[i] = camera_position(extrinsics[0][i])
+    mean_shift = np.mean(base_ring,axis=0)
+
+    # update extrinsic (translation only)
+    for i in range(num_arc):
+        for j in range(num_ring):
+            extrinsics[i][j]['translation'] -= np.matmul(extrinsics[i][j]['rotation'],mean_shift)
+    
+    #we use only  most bottom camera to optimize
+    rotation_matrix = np.zeros((num_ring , 3, 3))
+    translation_vector = np.zeros((num_ring, 3))
+    for i in range(num_ring):
+        rotation_matrix[i,:,:] = extrinsics[0][i]['rotation']
+        translation_vector[i,:] = extrinsics[0][i]['translation']
+
+    # optimize to find rotaiton corrector 
+    rotation_corrector = find_rotation_corrector(rotation_matrix,translation_vector)
+
+    # update extrinsic (rotation only)
     for i in range(num_arc):
         for j in range(num_ring):
             extrinsics[i][j]['rotation'] = np.matmul(extrinsics[i][j]['rotation'],rotation_corrector)
-            cam_points[i*num_ring+j] = camera_position(extrinsics[i][j])
 
-    ################
-    # Write output to colmap bin format
-    ##############
+    # update colmap's images
     images_old = images
     images = {}
     for image_id in images_old:
@@ -151,7 +160,7 @@ def main(args):
             point3D_ids=images_old[image_id][6]
         )
     
-    #update point3d
+    #update colmap's  point3d
     points3D_old = points3D
     points3D = {}
     for point_id in points3D_old:
@@ -163,10 +172,12 @@ def main(args):
             image_ids=points3D_old[point_id][4],
             point2D_idxs=points3D_old[point_id][5]
         )
-    
-    write_model(cameras, images, points3D, args.output, '.bin')
-    print("FINISHED!")
 
+    #write to binary output
+    write_model(cameras, images, points3D, args.output, output_extension)
+    total_time = timer() - start_timer
+    print('Finished in {:.2f} seconds'.format(total_time))
+    print('output are write to {}'.format(os.path.abspath(args.output)))
 
 def entry_point():
     parser = argparse.ArgumentParser(
@@ -175,24 +186,22 @@ def entry_point():
         '-i',
         '--input',
         type=str,
-        #required=True,
-        default='C:\\Datasets\\deeparc\\teabottle_green\\model\\distrort_model\\',
-        help='colmap model directory / colmap database file (.db)',
+        required=True,
+        help='colmap model directory',
     )
     parser.add_argument(
         '-o',
         '--output',
         type=str,
         default='output/',
-        #required=True,
-        help='deeparc file output')
+        help='deeparc file output (default: \'output/\')')
     parser.add_argument(
         '-p',
         '--pattern',
         type=str,
         #required=True,
         default='^cam(?:[0-9]+)\\/cam([0-9]+)_([0-9]+)\.(?:png|jpg)$',
-        help='file name pattern in regex style (default: \'^cam(?:[0-9]+)\\/cam([0-9]+)_([0-9]+)\.(?:png|jpg)$\' )')
+        help='file name pattern in regex style (default: \'^cam(?:[0-9]+)\\/cam([0-9]+)_([0-9]+)\.(?:png|jpg)$\')')
     main(parser.parse_args())
 
 if __name__ == "__main__":
